@@ -1,4 +1,4 @@
-NAME: Sony Interactive Entertainment Wireless Controller
+NAME: The Wheel thing
 PRODUCT: 2508
 VENDOR: 1356
 BUSTYPE: BUS_USB
@@ -8,9 +8,9 @@ EVENTS:
   EV_KEY: [BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_TL, BTN_TR, BTN_TL2, BTN_TR2, BTN_SELECT, BTN_START, BTN_MODE, BTN_THUMBL, BTN_THUMBR]
   EV_ABS:
     ABS_X:
-      VALUE: 512
+      VALUE: 32768
       MIN: 0
-      MAX: 1024
+      MAX: 65535
     ABS_Y:
       VALUE: 512
       MIN: 0

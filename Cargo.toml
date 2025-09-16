@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 clap = "4.5.47"
 input-linux = { version = "0.7.1", features = ["bytes", "serde"] }
-ordered-float = "5.0.0"
 serde = { version = "1.0.219", features = ["derive"] }
+timeout-readwrite = "0.4.0"

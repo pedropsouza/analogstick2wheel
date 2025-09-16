@@ -1,122 +1,187 @@
 use input_linux::*;
-use std::{default, hash::{DefaultHasher, Hash, Hasher}, io::{self, Read, Write}, mem};
-use ordered_float::OrderedFloat;
-
-// make floats hashable
-type F64 = OrderedFloat<f64>;
+use std::{
+    convert::From, default::Default, hash::{DefaultHasher, Hash, Hasher}, io::{self, Read, Write}, mem, ops::{Deref, SubAssign}, time::{Duration, Instant, UNIX_EPOCH}
+};
+use timeout_readwrite::TimeoutReader;
 
 #[derive(Clone, Copy, Hash)]
 struct Frame {
-    x: F64,
-    y: F64,
-    joystick_angle: F64,
-    wheel_angle: F64,
+    x: i32,
+    y: i32,
     state: State,
+}
+
+impl Frame {
+    pub fn analyze(&self) -> (f64,f64,State) {
+        let x = self.x as f64;
+        let y = self.y as f64;
+        let mag = (x.powi(2) + y.powi(2)).sqrt()/MAX_MAGNITUDE;
+        (y.atan2(x), mag, if mag > GRIP_THRESHOLD { State::Gripped } else { State::Freewheel })
+    }
+
+    pub fn resolve(&mut self) -> (f64, f64) {
+        let (a,m,s) = self.analyze();
+        self.state = s;
+        (a,m)
+    }
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Self {
+            x: Default::default(),
+            y: Default::default(),
+            state: State::Freewheel,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ProcessedFrame {
+    inner: Frame,
+    analog_angle: Option<f64>,
+    analog_magnitude: f64,
+}
+
+impl From<Frame> for ProcessedFrame {
+    fn from(mut value: Frame) -> Self {
+        let (a,m) = value.resolve();
+        Self {
+            inner: value,
+            analog_angle: Some(a),
+            analog_magnitude: m,
+        }
+    }
+}
+
+impl Deref for ProcessedFrame {
+    type Target = Frame;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl ProcessedFrame {
+    pub fn dbg_string(&self) -> String {
+        format!("x: {: >8.6}, y: {: >8.6}, analog_angle: {}, analog_magnitude: {: >8.6}, state: {:?}",
+                self.inner.x, self.inner.y,
+                self.analog_angle.map_or(" Undef. ".to_string(), |opt| format!("{: >8.6}", opt.to_degrees())),
+                self.analog_magnitude, self.state,
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum State {
     Freewheel,
     Gripped,
-    Sliding,
-}
-
-impl default::Default for Frame {
-    fn default() -> Self {
-        Self {
-            x: Default::default(),
-            y: Default::default(),
-            joystick_angle: Default::default(),
-            wheel_angle: Default::default(),
-            state: State::Freewheel,
-        }
-    }
-}
-
-impl Frame {
-    pub fn analyze(&mut self) -> f64 {
-        self.joystick_angle = F64::from(self.y.atan2(*self.x));
-        let mag = self.x.powi(2) + self.y.powi(2);
-        self.state = if mag > GRIP_THRESHOLD { State::Gripped } else { State::Freewheel };
-        mag
-    }
-
-    pub fn dbg_string(&self) -> String {
-        format!("x: {: >8.6}, y: {: >8.6}, joy_angle: {: >8.6}, wheel_angle: {: >8.6}, state: {:?}",
-                self.x, self.y, self.joystick_angle, self.wheel_angle, self.state,
-        )
-    }
-
-    pub fn quickhash(&self) -> u64 {
-        let mut s = DefaultHasher::new();
-        self.hash(&mut s);
-        s.finish()
-    }
 }
 
 // symmetrical, 5/4 ratio comes from the 900deg sweep, 450deg to each side
 //const STEERING_STOP: f64 = std::f64::consts::TAU * 5.0/4.0;
-const STEERING_STOP: f64 = std::f64::consts::TAU * 2.0;
-const GRIP_THRESHOLD: f64 = 1.0/5.0 * 1.0/5.0;
-const SLIDE_THRESHOLD: f64 = 9.5/10.0 * 9.5/10.0;
+const STEERING_STOP: f64 = std::f64::consts::TAU * 3.0;
+const MAX_MAGNITUDE: f64 = 128.0;
+const GRIP_THRESHOLD: f64 = 0.92;
+
+struct Data {
+    prev: ProcessedFrame,
+    cur: Frame,
+    wheel_angle: f64,
+    last_wheel_report: Instant,
+}
 
 fn main() {
-    let mut frames = [Frame::default()].repeat(2);
-    let mut prev_hash = frames[1].quickhash();
+    let mut timeout_stdin = TimeoutReader::new(io::stdin(), Duration::from_millis(20));
+    let mut data = Data {
+        last_wheel_report: Instant::now(),
+        wheel_angle: 0.0,
+        prev: Default::default(),
+        cur: Default::default(),
+    };
+
+    let tick = |data: &mut Data, event: SynchronizeEvent| {
+        if event.kind == SynchronizeKind::Report {
+            let processed = ProcessedFrame::from(data.cur);
+            data.wheel_angle = wheel_behaviour(data.wheel_angle, &processed, &data.prev, data.last_wheel_report.elapsed().as_secs_f64());
+            let axis_val = quantize_wheel_angle(data.wheel_angle);
+            write_output_event(axis_val, event.time);
+            eprintln!("{}, wheel_angle: {: >8.6} aka {:>5}   ",
+                    processed.dbg_string(),
+                    data.wheel_angle.to_degrees(),
+                    axis_val);
+            Some(processed)
+        } else {
+            io::stdout().write_all(event.as_event().as_bytes()).unwrap();
+            None
+        }
+    };
 
     loop {
-        let input =
-            read_input_event()
-            .map_err(|e| format!("{e}"))
-            .and_then(|x| { Event::new(x).map_err(|e| format!("{e}")) });
-        if let Err(e) = input {
-            eprintln!("error: {e}");
-            // flush garbage out
-            let mut buf: [u8; 256] = [0; 256];
-            let _ = io::stdin().read(&mut buf);
-            continue;
+        #[derive(Debug)]
+        enum LoopError {
+            Timeout,
+            EventCreation(RangeError),
+            Other(String),
         }
-        let event = input.unwrap();
+        let input =
+            read_input_event(&mut timeout_stdin)
+            .map_err(|e| match e {
+                e if e.kind() == io::ErrorKind::TimedOut => LoopError::Timeout,
+                e => LoopError::Other(e.to_string())
+            })
+            .and_then(|x| { Event::new(x).map_err(|e| LoopError::EventCreation(e)) });
 
-        match event {
-            Event::Absolute(event) => {
-                match event.axis {
-                    AbsoluteAxis::X => { frames[0].x = F64::from((event.value - 128) as f64)/128.0 },
-                    AbsoluteAxis::Y => { frames[0].y = F64::from((event.value - 128) as f64)/128.0 },
+        match input {
+            Ok(event) => {
+                match event {
+                    Event::Absolute(event) => {
+                        match event.axis {
+                            AbsoluteAxis::X => { data.cur.x = event.value - 128 },
+                            AbsoluteAxis::Y => { data.cur.y = event.value - 128 },
+                            _ => {
+                                io::stdout().write_all(event.as_event().as_bytes()).unwrap();
+                            },
+                        }
+                    },
+                    Event::Synchronize(event) => {
+                        if let Some(processed) = tick(&mut data, event) {
+                            data.prev = processed;
+                            data.last_wheel_report = Instant::now();
+                        }
+                        let sepoch = UNIX_EPOCH.elapsed().unwrap();
+                        let skew = sepoch.saturating_sub(
+                            Duration::from_secs(event.time.seconds() as u64).saturating_add(Duration::from_micros(event.time.microseconds() as u64))
+                        );
+
+                        eprintln!("skew is {:?}", skew);
+                    },
                     _ => {
                         io::stdout().write_all(event.as_event().as_bytes()).unwrap()
-                    },
+                    }
                 }
             },
-            Event::Synchronize(event) => {
-                let magnitude = frames[0].analyze();
-                let cur_hash = frames[0].quickhash();
-                let diff = prev_hash != cur_hash;
-                if event.kind == SynchronizeKind::Report && diff {
-                    let axis_val = wheel_behaviour(frames.as_mut_slice(), magnitude);
-                    frames[1] = frames[0];
-                    prev_hash = cur_hash;
-                    let synthesized_event
-                        = AbsoluteEvent::new(
-                            event.time,
-                            AbsoluteAxis::X,
-                            axis_val,
-                        );
-                    let output: Vec<u8>
-                        = [
-                            synthesized_event.into_event(),
-                            event.into_event()
-                        ].iter()
-                         .flat_map(|x| x.into_bytes())
-                         .collect();
-                    io::stdout().write_all(&output).unwrap();
-                    eprint!("\r{}                     ", frames[0].dbg_string())
-                } else {
-                    io::stdout().write_all(event.as_event().as_bytes()).unwrap()
+            Err(e) => {
+                match e {
+                    LoopError::Timeout => {},
+                    LoopError::Other(oe) => {
+                        eprintln!("error: {oe}");
+                        // flush garbage out
+                        let mut buf: [u8; 256] = [0; 256];
+                        let _ = io::stdin().read(&mut buf);
+                    }
+                    LoopError::EventCreation(ce) => {
+                        eprintln!("value range error: {ce}")
+                    }
                 }
             }
-            _ => {
-                io::stdout().write_all(event.as_event().as_bytes()).unwrap()
+        }
+        if data.wheel_angle.abs() > 0.0005 && data.prev.state == State::Freewheel {
+            let delta = Instant::now().duration_since(data.last_wheel_report);
+            if delta > Duration::from_millis(2) {
+                let unix_time = UNIX_EPOCH.elapsed().unwrap();
+                let timestamp = EventTime::new(unix_time.as_secs() as i64, unix_time.subsec_micros() as i64);
+                tick(&mut data, SynchronizeEvent::report(timestamp));
+                data.last_wheel_report = Instant::now();
             }
         }
         io::stdout().flush().unwrap();
@@ -124,37 +189,23 @@ fn main() {
 }
 
 fn lerp(from: f64, to: f64, t: f64) -> f64 {
+    let t = t.clamp(0.0,1.0);
     return (1.0-t)*from + t*to;
 }
 
-fn wheel_behaviour(frames: &mut [Frame], magnitude: f64) -> i32 {
-    let mut prev = frames[1];
-    let cur = &mut frames[0];
-    let mut angle = None;
-
-    match cur.state {
-        State::Gripped => {
-            if prev.state == State::Gripped {
-                if magnitude < SLIDE_THRESHOLD {
-                    cur.state = State::Sliding;
-                    angle = Some(lerp(*cur.wheel_angle, 0.0, 0.01)); // this is horrible for many reasons.
-                }
-            } else {
-                prev = *cur;
-            }
-        },
-        State::Sliding => unreachable!(),
-        State::Freewheel => { prev = *cur }
-    }
-
-    let angle = angle.unwrap_or({
-        let da = F64::from(cyclic_signed_distance(cur.joystick_angle.into(), prev.joystick_angle.into()));
-        cur.wheel_angle = F64::from((*da + *prev.wheel_angle).clamp(-STEERING_STOP, STEERING_STOP));
-        *cur.wheel_angle
-    });
-
-    let quantized_value = 512 + ((512.0/STEERING_STOP * angle).trunc() as i32);
-    quantized_value
+fn wheel_behaviour(cur_wheel_angle: f64, cur: &ProcessedFrame, prev: &ProcessedFrame, d_t: f64) -> f64 {
+    let easing = || { lerp(cur_wheel_angle, 0.0, ((std::f64::consts::TAU/4.0)*d_t).clamp(0.0,0.2)) };
+    cur.analog_angle.map(|aangle| {
+        match (prev.state, cur.state) {
+            (State::Gripped, State::Gripped) => {
+                let da = prev.analog_angle.map_or(0.0, |p_aangle| {
+                    cyclic_signed_distance(aangle, p_aangle)
+                });
+                da + cur_wheel_angle
+            },
+            _ => easing()
+        }
+    }).unwrap_or_else(easing).clamp(-STEERING_STOP, STEERING_STOP)
 }
 
 fn cyclic_signed_distance(a: f64, b: f64) -> f64 {
@@ -172,9 +223,31 @@ fn cyclic_signed_distance(a: f64, b: f64) -> f64 {
     r
 }
 
-fn read_input_event() -> io::Result<InputEvent> {
+fn quantize_wheel_angle(angle: f64) -> i32 {
+    const HALF_U16: i32 = u16::MAX as i32/2;
+    HALF_U16 + (HALF_U16 as f64/STEERING_STOP * angle).trunc() as i32
+}
+
+fn read_input_event<T: Read>(handle: &mut T) -> io::Result<InputEvent> {
     let mut buffer = [0u8; mem::size_of::<InputEvent>()];
-    io::stdin().read_exact(&mut buffer)?;
+    handle.read_exact(&mut buffer)?;
     let event = unsafe { mem::transmute(buffer) };
     return Ok(event)
+}
+
+fn write_output_event(axis_value: i32, timestamp: EventTime) {
+    let synthesized_event
+        = AbsoluteEvent::new(
+            timestamp,
+            AbsoluteAxis::X,
+            axis_value,
+        );
+    let output: Vec<u8>
+        = [
+            synthesized_event.into_event(),
+            SynchronizeEvent::new(timestamp, SynchronizeKind::Report, 0).into_event(),
+        ].iter()
+         .flat_map(|x| x.into_bytes())
+         .collect();
+    io::stdout().write_all(&output).unwrap();
 }
