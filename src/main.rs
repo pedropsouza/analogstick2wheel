@@ -1,8 +1,14 @@
 use input_linux::*;
 use std::{
-    convert::From, default::Default, hash::{DefaultHasher, Hash, Hasher}, io::{self, Read, Write}, mem, ops::{Deref, SubAssign}, time::{Duration, Instant, UNIX_EPOCH}
+    convert::From,
+    default::Default,
+    io::{self, Read, Write},
+    mem,
+    ops::Deref,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant, UNIX_EPOCH},
+    thread,
 };
-use timeout_readwrite::TimeoutReader;
 
 #[derive(Clone, Copy, Hash)]
 struct Frame {
@@ -80,9 +86,10 @@ enum State {
 // symmetrical, 5/4 ratio comes from the 900deg sweep, 450deg to each side
 //const STEERING_STOP: f64 = std::f64::consts::TAU * 5.0/4.0;
 const STEERING_STOP: f64 = std::f64::consts::TAU * 3.0;
-const MAX_MAGNITUDE: f64 = 128.0;
+const MAX_MAGNITUDE: f64 = 32767.0;
 const GRIP_THRESHOLD: f64 = 0.92;
 
+#[derive(Clone)]
 struct Data {
     prev: ProcessedFrame,
     cur: Frame,
@@ -91,62 +98,83 @@ struct Data {
 }
 
 fn main() {
-    let mut timeout_stdin = TimeoutReader::new(io::stdin(), Duration::from_millis(20));
-    let mut data = Data {
+    let data = Arc::new(RwLock::new(Data {
         last_wheel_report: Instant::now(),
         wheel_angle: 0.0,
         prev: Default::default(),
         cur: Default::default(),
-    };
+    }));
 
-    let tick = |data: &mut Data, event: SynchronizeEvent| {
-        if event.kind == SynchronizeKind::Report {
-            let processed = ProcessedFrame::from(data.cur);
-            data.wheel_angle = wheel_behaviour(data.wheel_angle, &processed, &data.prev, data.last_wheel_report.elapsed().as_secs_f64());
-            let axis_val = quantize_wheel_angle(data.wheel_angle);
-            write_output_event(axis_val, event.time);
-            eprintln!("{}, wheel_angle: {: >8.6} aka {:>5}   ",
-                    processed.dbg_string(),
-                    data.wheel_angle.to_degrees(),
-                    axis_val);
-            Some(processed)
-        } else {
-            io::stdout().write_all(event.as_event().as_bytes()).unwrap();
-            None
-        }
+    let tick =
+        |state: &mut Data, event: SynchronizeEvent| {
+            if event.kind == SynchronizeKind::Report {
+                let processed = ProcessedFrame::from(state.cur);
+                state.wheel_angle = wheel_behaviour(state.wheel_angle, &processed, &state.prev, state.last_wheel_report.elapsed().as_secs_f64());
+                let axis_val = quantize_wheel_angle(state.wheel_angle);
+                write_output_event(axis_val, event.time);
+                eprintln!("{}, wheel_angle: {: >8.6} aka {:>5}   ",
+                          processed.dbg_string(),
+                          state.wheel_angle.to_degrees(),
+                          axis_val);
+                Some(processed)
+            } else {
+                io::stdout().write_all(event.as_event().as_bytes()).unwrap();
+                None
+            }
+        };
+
+    {
+        let data_handle = data.clone();
+        let tick = tick.clone();
+        thread::spawn(move || {
+            loop {
+                let state = data_handle.read().unwrap().clone();
+                if state.wheel_angle.abs() > 0.0005 && state.prev.state == State::Freewheel {
+                    let delta = Instant::now().duration_since(state.last_wheel_report);
+                    if delta > Duration::from_millis(4) {
+                        let unix_time = UNIX_EPOCH.elapsed().unwrap();
+                        let timestamp = EventTime::new(unix_time.as_secs() as i64, unix_time.subsec_micros() as i64);
+                        let mut state = data_handle.write().unwrap();
+                        tick(&mut state, SynchronizeEvent::report(timestamp));
+                        state.last_wheel_report = Instant::now();
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        })
     };
 
     loop {
         #[derive(Debug)]
         enum LoopError {
-            Timeout,
             EventCreation(RangeError),
             Other(String),
         }
         let input =
-            read_input_event(&mut timeout_stdin)
+            read_input_event(&mut std::io::stdin())
             .map_err(|e| match e {
-                e if e.kind() == io::ErrorKind::TimedOut => LoopError::Timeout,
                 e => LoopError::Other(e.to_string())
             })
             .and_then(|x| { Event::new(x).map_err(|e| LoopError::EventCreation(e)) });
 
         match input {
             Ok(event) => {
+                let mut state = data.write().unwrap();
                 match event {
                     Event::Absolute(event) => {
                         match event.axis {
-                            AbsoluteAxis::X => { data.cur.x = event.value - 128 },
-                            AbsoluteAxis::Y => { data.cur.y = event.value - 128 },
+                            AbsoluteAxis::X => { state.cur.x = event.value; true },
+                            AbsoluteAxis::Y => { state.cur.y = event.value; true },
                             _ => {
                                 io::stdout().write_all(event.as_event().as_bytes()).unwrap();
+                                false
                             },
                         }
                     },
                     Event::Synchronize(event) => {
-                        if let Some(processed) = tick(&mut data, event) {
-                            data.prev = processed;
-                            data.last_wheel_report = Instant::now();
+                        if let Some(processed) = tick(&mut state, event) {
+                            state.prev = processed;
+                            state.last_wheel_report = Instant::now();
                         }
                         let sepoch = UNIX_EPOCH.elapsed().unwrap();
                         let skew = sepoch.saturating_sub(
@@ -154,15 +182,16 @@ fn main() {
                         );
 
                         eprintln!("skew is {:?}", skew);
+                        true
                     },
                     _ => {
-                        io::stdout().write_all(event.as_event().as_bytes()).unwrap()
+                        io::stdout().write_all(event.as_event().as_bytes()).unwrap();
+                        false
                     }
-                }
+                };
             },
             Err(e) => {
                 match e {
-                    LoopError::Timeout => {},
                     LoopError::Other(oe) => {
                         eprintln!("error: {oe}");
                         // flush garbage out
@@ -173,15 +202,6 @@ fn main() {
                         eprintln!("value range error: {ce}")
                     }
                 }
-            }
-        }
-        if data.wheel_angle.abs() > 0.0005 && data.prev.state == State::Freewheel {
-            let delta = Instant::now().duration_since(data.last_wheel_report);
-            if delta > Duration::from_millis(2) {
-                let unix_time = UNIX_EPOCH.elapsed().unwrap();
-                let timestamp = EventTime::new(unix_time.as_secs() as i64, unix_time.subsec_micros() as i64);
-                tick(&mut data, SynchronizeEvent::report(timestamp));
-                data.last_wheel_report = Instant::now();
             }
         }
         io::stdout().flush().unwrap();
